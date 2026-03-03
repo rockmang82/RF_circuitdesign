@@ -10,7 +10,8 @@ from collections import deque
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
-    QLabel, QProgressBar, QInputDialog, QMessageBox, QSizePolicy
+    QLabel, QProgressBar, QInputDialog, QMessageBox, QSizePolicy,
+    QDialog, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF
 from PyQt5.QtGui import (
@@ -143,6 +144,14 @@ class CircuitCanvas(QWidget):
         self._pending_click_pos = None
         self._click_timer.timeout.connect(self._process_single_click)
 
+        # 고스트 프리뷰 및 드래그 상태
+        self._ghost_pos: Optional[Tuple[int, int]] = None   # 고스트 스냅 위치
+        self._drag_start_comp: Optional['Component'] = None  # 드래그 후보 소자
+        self._drag_start_mouse: Optional[Tuple[int, int]] = None
+        self._dragging_comp: Optional['Component'] = None    # 실제 드래그 중 소자
+        _DRAG_THRESHOLD = 8  # px, 드래그로 간주하는 최소 이동거리
+        self._DRAG_THRESHOLD = _DRAG_THRESHOLD
+
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
 
@@ -159,7 +168,7 @@ class CircuitCanvas(QWidget):
             self._draw_wire(painter, wire)
         for comp in self.components:
             self._draw_component(painter, comp)
-        # Draw wiring preview dot
+        # 와이어링 시작 핀 강조
         if self.wiring_start:
             cid, pin = self.wiring_start
             pos = get_pin_pos_universal(cid, pin, self.components, self.height())
@@ -167,6 +176,22 @@ class CircuitCanvas(QWidget):
                 painter.setPen(QPen(COLOR_WIRE, 2))
                 painter.setBrush(QBrush(COLOR_WIRE))
                 painter.drawEllipse(pos[0] - 5, pos[1] - 5, 10, 10)
+        # 고스트 프리뷰: 새 소자 배치 모드 또는 기존 소자 드래그 중
+        if self._ghost_pos:
+            gx, gy = self._ghost_pos
+            # 드래그 중이면 고스트 소자의 연결선 점선 미리보기
+            if self._dragging_comp:
+                self._draw_ghost_wire_preview(painter, self._dragging_comp, gx, gy)
+            # 고스트 소자 그리기 (50% 불투명도)
+            ghost_type = (self._dragging_comp.type if self._dragging_comp
+                          else self.placement_mode)
+            ghost_rot = self._dragging_comp.rotation if self._dragging_comp else 0
+            if ghost_type:
+                painter.setOpacity(0.5)
+                ghost = Component(id='__ghost__', type=ghost_type,
+                                  x=gx, y=gy, rotation=ghost_rot, value=None)
+                self._draw_component(painter, ghost)
+                painter.setOpacity(1.0)
 
     def _draw_grid(self, painter: QPainter):
         pen = QPen(COLOR_GRID, 1, Qt.DotLine)
@@ -360,13 +385,22 @@ class CircuitCanvas(QWidget):
             self.update()
             return
 
-        # Component selection (use timer to distinguish dbl-click)
-        self._pending_click_pos = (x, y)
-        self._click_timer.start()
+        # 소자 위에 있으면 드래그 후보로 등록, 빈 공간이면 선택 해제 타이머
+        comp = self._find_component(x, y, radius=30)
+        if comp:
+            # 드래그 시작 후보: mouseMoveEvent에서 임계값 초과 시 드래그 활성화
+            self._drag_start_comp = comp
+            self._drag_start_mouse = (x, y)
+        else:
+            self._pending_click_pos = (x, y)
+            self._click_timer.start()
 
     def mouseDoubleClickEvent(self, event):
         self._click_timer.stop()
         self._pending_click_pos = None
+        # 드래그 후보 취소 (더블클릭은 드래그가 아님)
+        self._drag_start_comp = None
+        self._drag_start_mouse = None
         x, y = event.x(), event.y()
         comp = self._find_component(x, y, radius=30)
         if comp:
@@ -409,6 +443,11 @@ class CircuitCanvas(QWidget):
             self.wiring_start = None
             self.placement_mode = None
             self.move_mode = False
+            # 드래그/고스트 취소
+            self._dragging_comp = None
+            self._drag_start_comp = None
+            self._drag_start_mouse = None
+            self._ghost_pos = None
             self.update()
             return
 
@@ -461,6 +500,84 @@ class CircuitCanvas(QWidget):
             if c.selected:
                 return c
         return None
+
+    def _draw_ghost_wire_preview(self, painter: QPainter,
+                                  comp: 'Component', gx: int, gy: int):
+        """드래그 중 소자의 연결선 위치 변경을 점선으로 미리 표시."""
+        pen = QPen(QColor('#AAAAAA'), 1, Qt.DashLine)
+        painter.setPen(pen)
+        pins = ['left', 'right'] if comp.rotation == 0 else ['top', 'bottom']
+        # 고스트 위치의 핀 좌표 계산 (오프셋 적용)
+        dx, dy = gx - comp.x, gy - comp.y
+        for wire in self.wires:
+            for side, pin_name in [(wire.start_comp_id, wire.start_pin),
+                                   (wire.end_comp_id, wire.end_pin)]:
+                if side != comp.id:
+                    continue
+                # 이 와이어에서 상대방 핀 좌표
+                other_id = wire.end_comp_id if side == wire.start_comp_id else wire.start_comp_id
+                other_pin = wire.end_pin if side == wire.start_comp_id else wire.start_pin
+                p_other = get_pin_pos_universal(other_id, other_pin,
+                                                self.components, self.height())
+                if not p_other:
+                    continue
+                # 고스트 핀 좌표
+                orig_pin_pos = pin_pos(comp, pin_name)
+                ghost_pin_x = orig_pin_pos[0] + dx
+                ghost_pin_y = orig_pin_pos[1] + dy
+                pts = calc_wire_path(ghost_pin_x, ghost_pin_y,
+                                     p_other[0], p_other[1])
+                for i in range(len(pts) - 1):
+                    painter.drawLine(pts[i][0], pts[i][1],
+                                     pts[i+1][0], pts[i+1][1])
+
+    # ------------------------------------------------------------------
+    # Mouse Move / Release (고스트 프리뷰 & 드래그 확정)
+    # ------------------------------------------------------------------
+
+    def mouseMoveEvent(self, event):
+        x, y = event.x(), event.y()
+        # 새 소자 배치 모드: 고스트 위치 업데이트
+        if self.placement_mode:
+            self._ghost_pos = (snap(x), snap(y))
+            self.update()
+            return
+        # 드래그 후보 → 임계값 초과 시 실제 드래그 시작
+        if self._drag_start_comp is not None:
+            mx0, my0 = self._drag_start_mouse
+            if ((x - mx0)**2 + (y - my0)**2) ** 0.5 > self._DRAG_THRESHOLD:
+                self._dragging_comp = self._drag_start_comp
+                self._drag_start_comp = None
+                self._drag_start_mouse = None
+                self._click_timer.stop()
+                self._pending_click_pos = None
+        # 드래그 중: 고스트 위치 업데이트
+        if self._dragging_comp is not None:
+            self._ghost_pos = (snap(x), snap(y))
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        x, y = event.x(), event.y()
+        if self._dragging_comp is not None:
+            # 드래그 확정: 고스트 위치로 소자 이동
+            gx, gy = self._ghost_pos or (self._dragging_comp.x, self._dragging_comp.y)
+            self._dragging_comp.x = gx
+            self._dragging_comp.y = gy
+            # 연결된 와이어 모두 제거
+            self.wires = [w for w in self.wires
+                          if w.start_comp_id != self._dragging_comp.id
+                          and w.end_comp_id != self._dragging_comp.id]
+            self._dragging_comp = None
+            self._ghost_pos = None
+            self.update()
+        elif self._drag_start_comp is not None:
+            # 짧은 클릭 → 선택으로 처리 (더블클릭 구분용 타이머 사용)
+            self._drag_start_comp = None
+            self._drag_start_mouse = None
+            self._pending_click_pos = (x, y)
+            self._click_timer.start()
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +880,253 @@ class CalcWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Advanced Window (윈도우2 - Impedance Analysis)
+# ---------------------------------------------------------------------------
+
+class AdvancedWindow(QDialog):
+    """주파수 vs Magnitude / Phase 그래프 팝업 (비모달)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Advanced - Impedance Analysis')
+        self.resize(800, 600)
+        self.setMinimumSize(600, 400)
+        # 모달 아님: 메인 윈도우와 동시 조작 가능
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+
+        self._freqs: Optional[np.ndarray] = None   # MHz 단위 주파수 배열
+        self._Z_arr: Optional[np.ndarray] = None   # 복소 임피던스 배열
+        self._cursor_freq: Optional[float] = None   # 현재 커서 주파수
+
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(4)
+
+        # ── 툴바 ──────────────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel('Scale:'))
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItems(['Linear', 'Logarithmic'])
+        self.scale_combo.setFixedWidth(110)
+        self.scale_combo.currentTextChanged.connect(self._on_scale_changed)
+        toolbar.addWidget(self.scale_combo)
+
+        toolbar.addSpacing(20)
+        toolbar.addWidget(QLabel('Mag Unit:'))
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(['Ω', 'dB'])
+        self.unit_combo.setFixedWidth(70)
+        self.unit_combo.currentTextChanged.connect(self._on_mag_unit_changed)
+        toolbar.addWidget(self.unit_combo)
+        toolbar.addStretch()
+        root.addLayout(toolbar)
+
+        # ── 그래프3: Magnitude ────────────────────────────────────────────
+        from matplotlib.figure import Figure
+        self._fig3, self._ax3 = plt.subplots(figsize=(7, 3))
+        self._canvas3 = FigureCanvasQTAgg(self._fig3)
+        self._canvas3.mpl_connect('button_press_event', self._on_graph_click)
+        root.addWidget(self._canvas3, stretch=1)
+
+        # ── 그래프4: Phase ────────────────────────────────────────────────
+        self._fig4, self._ax4 = plt.subplots(figsize=(7, 3))
+        self._canvas4 = FigureCanvasQTAgg(self._fig4)
+        self._canvas4.mpl_connect('button_press_event', self._on_graph_click)
+        root.addWidget(self._canvas4, stretch=1)
+
+        # ── 상태바 ────────────────────────────────────────────────────────
+        self._status_label = QLabel('Cursor: —')
+        self._status_label.setStyleSheet('font-size: 10pt; padding: 2px 4px;')
+        root.addWidget(self._status_label)
+
+        # 초기 빈 그래프 표시
+        self._show_no_data()
+
+    # ------------------------------------------------------------------
+    # 데이터 업데이트 (Cal 버튼 클릭 시 메인윈도우에서 호출)
+    # ------------------------------------------------------------------
+
+    def update_plots(self, frequencies: list, impedances: list):
+        """Calculate 결과를 그래프에 반영."""
+        self._freqs = np.array(frequencies)       # MHz
+        self._Z_arr = np.array(impedances)         # complex
+        self._cursor_freq = None
+        self._redraw_all()
+
+    def _show_no_data(self):
+        """데이터 없을 때 안내 메시지 표시."""
+        for ax, canvas in [(self._ax3, self._canvas3),
+                           (self._ax4, self._canvas4)]:
+            ax.clear()
+            ax.text(0.5, 0.5, 'No data — Press Calculate',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=12, color='#9E9E9E')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            canvas.draw()
+
+    # ------------------------------------------------------------------
+    # 그래프 그리기
+    # ------------------------------------------------------------------
+
+    def _redraw_all(self):
+        if self._freqs is None or self._Z_arr is None:
+            self._show_no_data()
+            return
+        self._redraw_mag()
+        self._redraw_phase()
+
+    def _redraw_mag(self):
+        """그래프3: Magnitude 재렌더링."""
+        ax = self._ax3
+        ax.clear()
+        freqs = self._freqs
+        unit = self.unit_combo.currentText()
+        mag = np.abs(self._Z_arr)
+        if unit == 'dB':
+            y_data = 20 * np.log10(np.where(mag > 0, mag, 1e-30))
+            ylabel = 'Magnitude (dB)'
+        else:
+            y_data = mag
+            ylabel = 'Magnitude (Ω)'
+
+        scale = self.scale_combo.currentText()
+        ax.plot(freqs, y_data, color='#1E88E5', linewidth=1.5)
+        ax.set_xscale('log' if scale == 'Logarithmic' else 'linear')
+        ax.set_xlabel('Frequency (MHz)', fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(True, color='#E0E0E0', linestyle=':')
+        ax.set_facecolor('white')
+
+        # 커서 표시
+        if self._cursor_freq is not None:
+            self._draw_cursor_on_ax(ax, self._cursor_freq, freqs, y_data,
+                                    unit if unit == 'dB' else 'Ω', '#FF9800')
+        self._fig3.tight_layout()
+        self._canvas3.draw()
+
+    def _redraw_phase(self):
+        """그래프4: Phase 재렌더링."""
+        ax = self._ax4
+        ax.clear()
+        freqs = self._freqs
+        phase = np.angle(self._Z_arr, deg=True)
+
+        scale = self.scale_combo.currentText()
+        ax.plot(freqs, phase, color='#E53935', linewidth=1.5)
+        ax.set_xscale('log' if scale == 'Logarithmic' else 'linear')
+        ax.set_xlabel('Frequency (MHz)', fontsize=9)
+        ax.set_ylabel('Phase (°)', fontsize=9)
+        ax.set_ylim(-180, 180)
+        ax.set_yticks(range(-180, 181, 45))
+        ax.grid(True, color='#E0E0E0', linestyle=':')
+        ax.set_facecolor('white')
+
+        # 커서 표시
+        if self._cursor_freq is not None:
+            self._draw_cursor_on_ax(ax, self._cursor_freq, freqs, phase,
+                                    '°', '#FF9800')
+        self._fig4.tight_layout()
+        self._canvas4.draw()
+
+    def _draw_cursor_on_ax(self, ax, freq, freqs, y_data, unit_str, color):
+        """수직 커서라인 및 교차점 마커, 값 라벨 그리기."""
+        ax.axvline(freq, color=color, linewidth=1, zorder=10)
+        # 가장 가까운 데이터 포인트 인덱스
+        idx = int(np.argmin(np.abs(freqs - freq)))
+        yval = y_data[idx]
+        ax.plot(freqs[idx], yval, 'o', color=color, markersize=4, zorder=11)
+        sign = '+' if yval >= 0 else ''
+        ax.annotate(f'{sign}{yval:.2f}{unit_str}',
+                    (freqs[idx], yval),
+                    textcoords='offset points', xytext=(6, 4),
+                    fontsize=9,
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.8))
+
+    # ------------------------------------------------------------------
+    # 이벤트 핸들러
+    # ------------------------------------------------------------------
+
+    def _on_graph_click(self, event):
+        """그래프 클릭 → 커서라인 동기화."""
+        if event.xdata is None or self._freqs is None:
+            return
+        self._cursor_freq = event.xdata
+        self._update_cursor()
+
+    def _update_cursor(self):
+        """커서 위치에 따라 두 그래프와 상태바 업데이트."""
+        if self._freqs is None or self._cursor_freq is None:
+            return
+        freq = self._cursor_freq
+        idx = int(np.argmin(np.abs(self._freqs - freq)))
+        Z = self._Z_arr[idx]
+        mag = abs(Z)
+        phase = np.angle(Z, deg=True)
+        unit = self.unit_combo.currentText()
+        if unit == 'dB':
+            mag_str = f'{20 * np.log10(max(mag, 1e-30)):.2f}dB'
+        else:
+            mag_str = f'{mag:.2f}Ω'
+        sign = '+' if phase >= 0 else ''
+        self._status_label.setText(
+            f'Cursor: f={self._freqs[idx]:.2f}MHz  '
+            f'|Z|={mag_str}  ∠Z={sign}{phase:.1f}°'
+        )
+        # 두 그래프 재렌더링 (커서 포함)
+        self._redraw_mag()
+        self._redraw_phase()
+
+    def _on_scale_changed(self, _):
+        """X축 스케일 전환 → 두 그래프 동시 업데이트."""
+        self._redraw_all()
+
+    def _on_mag_unit_changed(self, _):
+        """Magnitude 단위 전환 → 그래프3만 업데이트."""
+        self._redraw_mag()
+        # 상태바도 단위 반영
+        if self._cursor_freq is not None:
+            self._update_cursor()
+
+
+# ---------------------------------------------------------------------------
+# Smith Chart Widget (캔버스 + Advanced 버튼 컨테이너)
+# ---------------------------------------------------------------------------
+
+class SmithChartWidget(QWidget):
+    """SmithChartCanvas를 감싸고 우측 상단에 Advanced 버튼을 배치하는 컨테이너."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.canvas = SmithChartCanvas()
+        layout.addWidget(self.canvas)
+
+        # Advanced 버튼 (오버레이, 부모 위젯 기준 절대 위치)
+        self.adv_btn = QPushButton('Advanced', self)
+        self.adv_btn.setFixedSize(80, 28)
+        self.adv_btn.setStyleSheet(
+            'QPushButton { background-color: #4A90D9; color: white; '
+            'font-size: 10pt; border-radius: 4px; }'
+            'QPushButton:hover { background-color: #357ABD; }'
+        )
+        self._position_adv_btn()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_adv_btn()
+
+    def _position_adv_btn(self):
+        """Advanced 버튼을 우측 상단(margin 5px)에 위치."""
+        self.adv_btn.move(self.width() - 80 - 5, 5)
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -770,10 +1134,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('RF Circuit Design - Smith Chart Analyzer')
-        self.setFixedSize(1200, 600)
+        # 기본 크기 1800×900, 최소 1200×600, 자유 리사이즈
+        self.resize(1800, 900)
+        self.setMinimumSize(1200, 600)
         self._worker: Optional[CalcWorker] = None
-        self._last_freqs = []
-        self._last_Z = []
+        self._last_freqs: list = []
+        self._last_Z: list = []
+        self._advanced_win: Optional[AdvancedWindow] = None
+        self._splitter_ratio: float = 0.6   # 기본 60:40 비율
         self._build_ui()
 
     def _build_ui(self):
@@ -818,20 +1186,58 @@ class MainWindow(QMainWindow):
         toolbar.addStretch()
         root_layout.addLayout(toolbar)
 
-        # Splitter: left=circuit canvas, right=smith chart
-        splitter = QSplitter(Qt.Horizontal)
+        # Splitter: 좌=회로 편집(60%), 우=스미스차트(40%)
+        self.splitter = QSplitter(Qt.Horizontal)
 
         self.circuit_canvas = CircuitCanvas()
-        self.circuit_canvas.setMinimumWidth(580)
+        self.circuit_canvas.setMinimumWidth(480)
 
-        self.smith_canvas = SmithChartCanvas()
-        self.smith_canvas.setMinimumWidth(580)
+        # SmithChartWidget: 캔버스 + Advanced 버튼 컨테이너
+        self.smith_widget = SmithChartWidget()
+        self.smith_widget.setMinimumWidth(320)
+        self.smith_canvas = self.smith_widget.canvas  # 기존 참조 유지
 
-        splitter.addWidget(self.circuit_canvas)
-        splitter.addWidget(self.smith_canvas)
-        splitter.setSizes([600, 600])
+        self.splitter.addWidget(self.circuit_canvas)
+        self.splitter.addWidget(self.smith_widget)
+        # 초기 60:40 비율 설정
+        total = 1800
+        self.splitter.setSizes([int(total * 0.6), int(total * 0.4)])
+        # 리사이즈 시 비율 유지
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
 
-        root_layout.addWidget(splitter, stretch=1)
+        # Advanced 버튼 → AdvancedWindow 열기
+        self.smith_widget.adv_btn.clicked.connect(self._open_advanced)
+
+        root_layout.addWidget(self.splitter, stretch=1)
+
+    def resizeEvent(self, event):
+        """윈도우 리사이즈 시 현재 스플리터 비율 유지."""
+        super().resizeEvent(event)
+        total = self.splitter.width()
+        if total > 0:
+            self.splitter.setSizes([
+                int(total * self._splitter_ratio),
+                total - int(total * self._splitter_ratio)
+            ])
+
+    def _on_splitter_moved(self, pos: int, index: int):
+        """사용자가 스플리터 핸들을 드래그한 경우 새 비율을 저장."""
+        sizes = self.splitter.sizes()
+        total = sum(sizes)
+        if total > 0:
+            self._splitter_ratio = sizes[0] / total
+
+    def _open_advanced(self):
+        """Advanced 버튼 클릭: AdvancedWindow 열기 (중복 방지)."""
+        if self._advanced_win is None or not self._advanced_win.isVisible():
+            self._advanced_win = AdvancedWindow(self)
+            # 마지막 계산 결과가 있으면 즉시 표시
+            if self._last_freqs:
+                self._advanced_win.update_plots(self._last_freqs, self._last_Z)
+            self._advanced_win.show()
+        else:
+            self._advanced_win.activateWindow()
+            self._advanced_win.raise_()
 
     def _set_placement(self, comp_type: str):
         self.circuit_canvas.placement_mode = comp_type
@@ -872,7 +1278,11 @@ class MainWindow(QMainWindow):
         self._last_Z = Z_list
         self.progress_bar.setVisible(False)
         self.cal_btn.setEnabled(True)
+        # 스미스 차트 업데이트
         self.smith_canvas.plot_results(freqs, Z_list)
+        # AdvancedWindow가 열려있으면 함께 업데이트
+        if self._advanced_win and self._advanced_win.isVisible():
+            self._advanced_win.update_plots(freqs, Z_list)
 
     def _on_calc_error(self, msg: str):
         self.progress_bar.setVisible(False)
