@@ -2,6 +2,7 @@
 
 import sys
 import uuid
+import json
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -11,7 +12,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
     QLabel, QProgressBar, QInputDialog, QMessageBox, QSizePolicy,
-    QDialog, QComboBox
+    QDialog, QComboBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF
 from PyQt5.QtGui import (
@@ -39,6 +40,7 @@ class Component:
     value: Optional[float]
     selected: bool = False
     error_highlight: bool = False
+    label: str = ''
 
 
 @dataclass
@@ -55,6 +57,7 @@ class Wire:
 # ---------------------------------------------------------------------------
 
 GRID = 20
+SNAP = 10
 PORT_X = 60
 COLOR_DEFAULT = QColor('#212121')
 COLOR_SELECTED = QColor('#1565C0')
@@ -74,7 +77,7 @@ ERRORS = {
 
 
 def snap(v: int) -> int:
-    return round(v / GRID) * GRID
+    return round(v / SNAP) * SNAP
 
 
 def new_id() -> str:
@@ -145,12 +148,24 @@ class CircuitCanvas(QWidget):
         self._click_timer.timeout.connect(self._process_single_click)
 
         # 고스트 프리뷰 및 드래그 상태
-        self._ghost_pos: Optional[Tuple[int, int]] = None   # 고스트 스냅 위치
-        self._drag_start_comp: Optional['Component'] = None  # 드래그 후보 소자
+        self._ghost_pos: Optional[Tuple[int, int]] = None
+        self._drag_start_comp: Optional['Component'] = None
         self._drag_start_mouse: Optional[Tuple[int, int]] = None
-        self._dragging_comp: Optional['Component'] = None    # 실제 드래그 중 소자
-        _DRAG_THRESHOLD = 8  # px, 드래그로 간주하는 최소 이동거리
-        self._DRAG_THRESHOLD = _DRAG_THRESHOLD
+        self._dragging_comp: Optional['Component'] = None
+        self._DRAG_THRESHOLD = 8
+
+        # 고무밴드 선택 상태
+        self._rubber_band_active: bool = False
+        self._rubber_band_start: Optional[Tuple[int, int]] = None
+        self._rubber_band_end: Optional[Tuple[int, int]] = None
+
+        # 그룹 드래그 상태
+        self._group_dragging: bool = False
+        self._group_drag_start_mouse: Optional[Tuple[int, int]] = None
+        self._group_drag_origins: Dict[str, Tuple[int, int]] = {}
+
+        # 소자 번호 카운터 (타입별)
+        self._type_counters: Dict[str, int] = {}
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -192,6 +207,16 @@ class CircuitCanvas(QWidget):
                                   x=gx, y=gy, rotation=ghost_rot, value=None)
                 self._draw_component(painter, ghost)
                 painter.setOpacity(1.0)
+
+        # 고무밴드 선택 영역 그리기
+        if self._rubber_band_active and self._rubber_band_start and self._rubber_band_end:
+            rx1, ry1 = self._rubber_band_start
+            rx2, ry2 = self._rubber_band_end
+            rect = QRectF(min(rx1, rx2), min(ry1, ry2),
+                          abs(rx2 - rx1), abs(ry2 - ry1))
+            painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.DashLine))
+            painter.setBrush(QBrush(QColor(0, 120, 215, 40)))
+            painter.drawRect(rect)
 
     def _draw_grid(self, painter: QPainter):
         pen = QPen(COLOR_GRID, 1, Qt.DotLine)
@@ -267,15 +292,23 @@ class CircuitCanvas(QWidget):
 
         painter.restore()
 
+        # Component number label (blue italic, always horizontal, above symbol)
+        if comp.label and comp.id != '__ghost__':
+            font_num = QFont('Arial', 9)
+            font_num.setItalic(True)
+            painter.setFont(font_num)
+            painter.setPen(QPen(QColor('#0000FF'), 1))
+            painter.drawText(comp.x - 10, comp.y - 18, comp.label)
+
         # Value label
         font = QFont('Arial', 9)
         painter.setFont(font)
         painter.setPen(QPen(QColor('#9E9E9E') if comp.value is None else COLOR_DEFAULT, 1))
-        label = self._value_label(comp)
+        val_label = self._value_label(comp)
         if comp.rotation == 0:
-            painter.drawText(comp.x - 20, comp.y + 25, label)
+            painter.drawText(comp.x - 20, comp.y + 25, val_label)
         else:
-            painter.drawText(comp.x + 14, comp.y + 5, label)
+            painter.drawText(comp.x + 14, comp.y + 5, val_label)
 
     def _draw_resistor(self, painter: QPainter):
         path = QPainterPath()
@@ -330,36 +363,36 @@ class CircuitCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
         x, y = event.x(), event.y()
+        shift_held = bool(event.modifiers() & Qt.ShiftModifier)
 
-        # ESC handled in keyPress; here handle placement
+        # 배치 모드: 소자 배치
         if self.placement_mode:
             sx, sy = snap(x), snap(y)
-            # Prevent placement near port
             if abs(sx - PORT_X) < 40:
                 return
             comp = Component(
                 id=new_id(), type=self.placement_mode,
-                x=sx, y=sy, rotation=0, value=None
+                x=sx, y=sy, rotation=0, value=None,
+                label=self._next_label(self.placement_mode)
             )
             self.components.append(comp)
             self.placement_mode = None
             self.update()
             return
 
-        # Move mode
+        # 이동 모드
         if self.move_mode:
             sel = self._selected_component()
             if sel:
                 sx, sy = snap(x), snap(y)
                 sel.x, sel.y = sx, sy
-                # Remove connected wires
                 self.wires = [w for w in self.wires
                               if w.start_comp_id != sel.id and w.end_comp_id != sel.id]
                 self.move_mode = False
                 self.update()
             return
 
-        # Check pin click first (radius 8px)
+        # 핀 클릭 (와이어 연결)
         pin_hit = self._find_pin(x, y, radius=8)
         if pin_hit:
             if self.wiring_start is None:
@@ -368,7 +401,6 @@ class CircuitCanvas(QWidget):
                 if pin_hit == self.wiring_start:
                     self.wiring_start = None
                 else:
-                    # Check no duplicate wire
                     sc, sp = self.wiring_start
                     ec, ep = pin_hit
                     w = Wire(id=new_id(),
@@ -379,21 +411,44 @@ class CircuitCanvas(QWidget):
             self.update()
             return
 
-        # Cancel wiring on empty space
+        # 와이어링 중 빈 공간 클릭 → 취소
         if self.wiring_start:
             self.wiring_start = None
             self.update()
             return
 
-        # 소자 위에 있으면 드래그 후보로 등록, 빈 공간이면 선택 해제 타이머
+        # 소자 히트 테스트
         comp = self._find_component(x, y, radius=30)
         if comp:
-            # 드래그 시작 후보: mouseMoveEvent에서 임계값 초과 시 드래그 활성화
-            self._drag_start_comp = comp
-            self._drag_start_mouse = (x, y)
+            if shift_held:
+                # Shift+클릭: 선택 토글
+                comp.selected = not comp.selected
+                self.update()
+            else:
+                selected_comps = self._get_selected_comps()
+                if comp.selected and len(selected_comps) > 1:
+                    # 그룹 드래그 시작
+                    self._group_dragging = True
+                    self._group_drag_start_mouse = (x, y)
+                    self._group_drag_origins = {c.id: (c.x, c.y) for c in selected_comps}
+                else:
+                    # 단일 소자 드래그 후보
+                    if not comp.selected:
+                        for c in self.components:
+                            c.selected = False
+                        comp.selected = True
+                    self._drag_start_comp = comp
+                    self._drag_start_mouse = (x, y)
         else:
-            self._pending_click_pos = (x, y)
-            self._click_timer.start()
+            if not shift_held:
+                # 빈 공간 클릭: 전체 선택 해제 + 고무밴드 시작
+                for c in self.components:
+                    c.selected = False
+            # 고무밴드 드래그 시작
+            self._rubber_band_active = True
+            self._rubber_band_start = (x, y)
+            self._rubber_band_end = (x, y)
+            self.update()
 
     def mouseDoubleClickEvent(self, event):
         self._click_timer.stop()
@@ -443,32 +498,50 @@ class CircuitCanvas(QWidget):
             self.wiring_start = None
             self.placement_mode = None
             self.move_mode = False
-            # 드래그/고스트 취소
             self._dragging_comp = None
             self._drag_start_comp = None
             self._drag_start_mouse = None
             self._ghost_pos = None
+            self._rubber_band_active = False
+            self._rubber_band_start = None
+            self._rubber_band_end = None
+            self._group_dragging = False
+            self._group_drag_start_mouse = None
+            self._group_drag_origins = {}
             self.update()
             return
 
-        sel = self._selected_component()
-        if sel is None:
+        selected = self._get_selected_comps()
+        if not selected:
             return
 
         if key == Qt.Key_R:
-            sel.rotation = 90 if sel.rotation == 0 else 0
+            # 선택된 모든 소자 회전
+            for c in selected:
+                c.rotation = 90 if c.rotation == 0 else 0
             self.update()
         elif key == Qt.Key_Delete:
+            # 선택된 모든 소자 및 연결 와이어 삭제
+            ids = {c.id for c in selected}
             self.wires = [w for w in self.wires
-                         if w.start_comp_id != sel.id and w.end_comp_id != sel.id]
-            self.components.remove(sel)
+                          if w.start_comp_id not in ids and w.end_comp_id not in ids]
+            self.components = [c for c in self.components if c.id not in ids]
             self.update()
         elif key == Qt.Key_M:
-            self.move_mode = True
+            if len(selected) == 1:
+                self.move_mode = True
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _next_label(self, comp_type: str) -> str:
+        """소자 타입별 순번 라벨 생성 (R1, L2, C3 ...)."""
+        self._type_counters[comp_type] = self._type_counters.get(comp_type, 0) + 1
+        return f"{comp_type}{self._type_counters[comp_type]}"
+
+    def _get_selected_comps(self) -> List[Component]:
+        return [c for c in self.components if c.selected]
 
     def _find_component(self, x, y, radius=30) -> Optional[Component]:
         best, best_d = None, radius + 1
@@ -537,12 +610,33 @@ class CircuitCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         x, y = event.x(), event.y()
+
         # 새 소자 배치 모드: 고스트 위치 업데이트
         if self.placement_mode:
             self._ghost_pos = (snap(x), snap(y))
             self.update()
             return
-        # 드래그 후보 → 임계값 초과 시 실제 드래그 시작
+
+        # 고무밴드 업데이트
+        if self._rubber_band_active:
+            self._rubber_band_end = (x, y)
+            self.update()
+            return
+
+        # 그룹 드래그: 선택된 소자들을 동일 델타로 이동
+        if self._group_dragging:
+            mx0, my0 = self._group_drag_start_mouse
+            dx = snap(x - mx0)
+            dy = snap(y - my0)
+            for c in self.components:
+                if c.id in self._group_drag_origins:
+                    ox, oy = self._group_drag_origins[c.id]
+                    c.x = ox + dx
+                    c.y = oy + dy
+            self.update()
+            return
+
+        # 단일 드래그 후보 → 임계값 초과 시 실제 드래그 시작
         if self._drag_start_comp is not None:
             mx0, my0 = self._drag_start_mouse
             if ((x - mx0)**2 + (y - my0)**2) ** 0.5 > self._DRAG_THRESHOLD:
@@ -551,7 +645,8 @@ class CircuitCanvas(QWidget):
                 self._drag_start_mouse = None
                 self._click_timer.stop()
                 self._pending_click_pos = None
-        # 드래그 중: 고스트 위치 업데이트
+
+        # 단일 드래그 중: 고스트 위치 업데이트
         if self._dragging_comp is not None:
             self._ghost_pos = (snap(x), snap(y))
             self.update()
@@ -560,12 +655,36 @@ class CircuitCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
         x, y = event.x(), event.y()
+
+        # 고무밴드 선택 확정
+        if self._rubber_band_active:
+            self._rubber_band_active = False
+            if self._rubber_band_start:
+                rx1, ry1 = self._rubber_band_start
+                rx2, ry2 = self._rubber_band_end or (x, y)
+                rect = QRectF(min(rx1, rx2), min(ry1, ry2),
+                              abs(rx2 - rx1), abs(ry2 - ry1))
+                for c in self.components:
+                    if rect.contains(c.x, c.y):
+                        c.selected = True
+            self._rubber_band_start = None
+            self._rubber_band_end = None
+            self.update()
+            return
+
+        # 그룹 드래그 확정
+        if self._group_dragging:
+            self._group_dragging = False
+            self._group_drag_start_mouse = None
+            self._group_drag_origins = {}
+            self.update()
+            return
+
+        # 단일 드래그 확정
         if self._dragging_comp is not None:
-            # 드래그 확정: 고스트 위치로 소자 이동
             gx, gy = self._ghost_pos or (self._dragging_comp.x, self._dragging_comp.y)
             self._dragging_comp.x = gx
             self._dragging_comp.y = gy
-            # 연결된 와이어 모두 제거
             self.wires = [w for w in self.wires
                           if w.start_comp_id != self._dragging_comp.id
                           and w.end_comp_id != self._dragging_comp.id]
@@ -573,7 +692,7 @@ class CircuitCanvas(QWidget):
             self._ghost_pos = None
             self.update()
         elif self._drag_start_comp is not None:
-            # 짧은 클릭 → 선택으로 처리 (더블클릭 구분용 타이머 사용)
+            # 짧은 클릭 → 더블클릭 구분용 타이머로 처리
             self._drag_start_comp = None
             self._drag_start_mouse = None
             self._pending_click_pos = (x, y)
@@ -1134,8 +1253,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('RF Circuit Design - Smith Chart Analyzer')
-        # 기본 크기 1800×900, 최소 1200×600, 자유 리사이즈
-        self.resize(1800, 900)
+        # 기본 크기 1600×800, 최소 1200×600, 자유 리사이즈
+        self.resize(1600, 800)
         self.setMinimumSize(1200, 600)
         self._worker: Optional[CalcWorker] = None
         self._last_freqs: list = []
@@ -1177,6 +1296,16 @@ class MainWindow(QMainWindow):
         self.cal_btn.clicked.connect(self.on_cal_clicked)
         toolbar.addWidget(self.cal_btn)
 
+        self.save_btn = QPushButton('Save')
+        self.save_btn.setFixedSize(50, 30)
+        self.save_btn.clicked.connect(self.save_circuit)
+        toolbar.addWidget(self.save_btn)
+
+        self.load_btn = QPushButton('Load')
+        self.load_btn.setFixedSize(50, 30)
+        self.load_btn.clicked.connect(self.load_circuit)
+        toolbar.addWidget(self.load_btn)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedWidth(150)
         self.progress_bar.setRange(0, 100)
@@ -1200,7 +1329,7 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.circuit_canvas)
         self.splitter.addWidget(self.smith_widget)
         # 초기 60:40 비율 설정
-        total = 1800
+        total = 1600
         self.splitter.setSizes([int(total * 0.6), int(total * 0.4)])
         # 리사이즈 시 비율 유지
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
@@ -1288,6 +1417,80 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.cal_btn.setEnabled(True)
         QMessageBox.critical(self, '계산 오류', msg)
+
+    def save_circuit(self):
+        """회로를 JSON 파일로 저장."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, '회로 저장', '', 'JSON Files (*.json);;All Files (*)')
+        if not path:
+            return
+        data = {
+            'version': '1.0',
+            'components': [
+                {'id': c.id, 'type': c.type, 'x': c.x, 'y': c.y,
+                 'rotation': c.rotation, 'value': c.value, 'label': c.label}
+                for c in self.circuit_canvas.components
+            ],
+            'wires': [
+                {'id': w.id, 'start_comp_id': w.start_comp_id,
+                 'start_pin': w.start_pin, 'end_comp_id': w.end_comp_id,
+                 'end_pin': w.end_pin}
+                for w in self.circuit_canvas.wires
+            ]
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.critical(self, '저장 오류', str(e))
+
+    def load_circuit(self):
+        """JSON 파일에서 회로를 불러오기."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, '회로 불러오기', '', 'JSON Files (*.json);;All Files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, '불러오기 오류', str(e))
+            return
+
+        canvas = self.circuit_canvas
+        canvas.components = []
+        canvas.wires = []
+        canvas._type_counters = {}
+
+        for cd in data.get('components', []):
+            c = Component(
+                id=cd['id'], type=cd['type'],
+                x=cd['x'], y=cd['y'],
+                rotation=cd.get('rotation', 0),
+                value=cd.get('value'),
+                label=cd.get('label', '')
+            )
+            canvas.components.append(c)
+            # 타입 카운터 복원
+            if c.label:
+                try:
+                    num = int(c.label[len(c.type):])
+                    canvas._type_counters[c.type] = max(
+                        canvas._type_counters.get(c.type, 0), num)
+                except (ValueError, IndexError):
+                    pass
+
+        for wd in data.get('wires', []):
+            w = Wire(
+                id=wd['id'],
+                start_comp_id=wd['start_comp_id'],
+                start_pin=wd['start_pin'],
+                end_comp_id=wd['end_comp_id'],
+                end_pin=wd['end_pin']
+            )
+            canvas.wires.append(w)
+
+        canvas.update()
 
     def validate_circuit(self) -> Optional[str]:
         # Freq validation
